@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +74,194 @@ def _assert_searchable_store_integrity(store: MessageStore) -> None:
         conn, build_message_fts_spec()
     )["status"] == "pass"
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def _assert_writer_blocked(db_path: Path) -> None:
+    probe = subprocess.run(
+        [sys.executable, "-c", """
+import sqlite3
+import sys
+conn = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    conn.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as exc:
+    if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+        raise
+    print('blocked')
+else:
+    conn.rollback()
+    print('acquired')
+finally:
+    conn.close()
+""", str(db_path)],
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert probe.stdout.strip() == "blocked", probe.stdout + probe.stderr
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+@pytest.mark.parametrize("journal_mode", ["WAL", "DELETE"])
+@pytest.mark.parametrize("operation", ["prepare", "restrict"])
+def test_permission_changes_preserve_live_sqlite_write_lock(
+    tmp_path, mode, journal_mode, operation,
+):
+    db_path = tmp_path / "lcm.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        assert conn.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0] == journal_mode.lower()
+        conn.execute("CREATE TABLE lock_probe(value TEXT)")
+        conn.execute("INSERT INTO lock_probe VALUES ('original')")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE lock_probe SET value='uncommitted'")
+        for artifact in _sqlite_artifacts(db_path):
+            if artifact.exists():
+                artifact.chmod(mode)
+        _assert_writer_blocked(db_path)
+
+        if operation == "prepare":
+            sqlite_util_module._prepare_private_sqlite_file(db_path)
+        else:
+            sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+
+        _assert_private_sqlite_artifacts(db_path)
+        _assert_writer_blocked(db_path)
+        conn.commit()
+    finally:
+        conn.close()
+    with sqlite3.connect(db_path) as fresh:
+        assert fresh.execute("SELECT value FROM lock_probe").fetchone()[0] == "uncommitted"
+        assert fresh.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_message_stores_keep_live_sidecars_across_external_reader(tmp_path, mode):
+    db_path = tmp_path / "lcm.db"
+    first = MessageStore(db_path)
+    second = None
+    try:
+        first.append("session", {"role": "user", "content": "before reader"})
+        first.commit()
+        for artifact in _sqlite_artifacts(db_path):
+            if artifact.exists():
+                artifact.chmod(mode)
+        second = MessageStore(db_path)
+        identities = {
+            suffix: (tmp_path / ("lcm.db" + suffix)).stat().st_ino
+            for suffix in ("-wal", "-shm")
+        }
+        probe = subprocess.run(
+            [sys.executable, "-c", """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+try:
+    assert conn.execute('SELECT count(*) FROM messages').fetchone()[0] == 1
+finally:
+    conn.close()
+""", str(db_path)],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert not probe.stderr
+        for suffix, inode in identities.items():
+            assert (tmp_path / ("lcm.db" + suffix)).stat().st_ino == inode
+        first.append("session", {"role": "user", "content": "after reader"})
+        first.commit()
+        second.append("session", {"role": "user", "content": "second store"})
+        second.commit()
+        assert first.search("reader", limit=10)
+    finally:
+        if second is not None:
+            second.close()
+        first.close()
+    with sqlite3.connect(db_path) as fresh:
+        assert fresh.execute("SELECT count(*) FROM messages").fetchone()[0] == 3
+        assert fresh.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize("operation", ["prepare", "restrict"])
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_private_artifact_rejects_swap_after_parent_stat(
+    tmp_path, monkeypatch, operation, link_kind,
+):
+    db_path = tmp_path / "lcm.db"
+    db_path.touch(mode=0o600)
+    db_path.chmod(0o600)
+    target = tmp_path / "unrelated"
+    target.write_bytes(b"untouched")
+    target.chmod(0o644)
+    real_stat = os.stat
+    swapped = False
+
+    def swap_after_stat(path, *args, **kwargs):
+        nonlocal swapped
+        result = real_stat(path, *args, **kwargs)
+        if not swapped and path == db_path.name and kwargs.get("dir_fd") is not None:
+            swapped = True
+            db_path.unlink()
+            if link_kind == "symlink":
+                db_path.symlink_to(target)
+            else:
+                os.link(target, db_path)
+        return result
+
+    monkeypatch.setattr(sqlite_util_module.os, "stat", swap_after_stat)
+    with pytest.raises(OSError, match="SQLite artifact"):
+        if operation == "prepare":
+            sqlite_util_module._prepare_private_sqlite_file(db_path)
+        else:
+            sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+    assert swapped
+    assert _mode(target) == 0o644
+    assert target.read_bytes() == b"untouched"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "launch", "null", "empty", "bad_result", "bad_error"])
+def test_permission_worker_failure_preserves_live_lock(tmp_path, monkeypatch, failure):
+    db_path = tmp_path / "lcm.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(value TEXT)")
+        conn.execute("BEGIN IMMEDIATE")
+        db_path.chmod(0o644)
+        with monkeypatch.context() as patch:
+            def fail_worker(*args, **kwargs):
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired("permission worker", 10)
+                if failure == "launch":
+                    raise FileNotFoundError("worker interpreter missing")
+                output = {
+                    "null": "null", "empty": "{}",
+                    "bad_result": '{"result": "true"}',
+                    "bad_error": '{"error": []}',
+                }[failure]
+                return subprocess.CompletedProcess(args[0], 0, output, "")
+            patch.setattr(sqlite_util_module.subprocess, "run", fail_worker)
+            with pytest.raises(OSError, match="permission worker failed"):
+                sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+        assert _mode(db_path) == 0o644
+        _assert_writer_blocked(db_path)
+    finally:
+        conn.close()
+
+
+def test_permission_worker_rejects_replacement_before_start(tmp_path, monkeypatch):
+    db_path = tmp_path / "lcm.db"
+    db_path.write_bytes(b"original")
+    db_path.chmod(0o644)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replacement")
+    replacement.chmod(0o644)
+    real_worker = sqlite_util_module._run_sqlite_permission_worker
+
+    def replace_then_run(path, **kwargs):
+        db_path.unlink()
+        replacement.rename(db_path)
+        return real_worker(path, **kwargs)
+
+    monkeypatch.setattr(sqlite_util_module, "_run_sqlite_permission_worker", replace_then_run)
+    with pytest.raises(OSError, match="directory entry changed before permission worker"):
+        sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+    assert _mode(db_path) == 0o644
 
 
 def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
@@ -194,10 +384,22 @@ def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix)
     assert _mode(target) == 0o644
 
 
+@pytest.fixture
+def inline_permission_worker(monkeypatch):
+    # Race injection must run inside the worker's fd-based operation. Keep it
+    # in-process for these deterministic security tests only; the lock tests
+    # above always exercise the real subprocess boundary.
+    monkeypatch.setattr(
+        sqlite_util_module, "_run_sqlite_permission_worker",
+        sqlite_util_module._chmod_sqlite_artifact_in_worker_at,
+    )
+
+
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
 def test_message_store_refuses_sidecar_link_swap_before_chmod(
     tmp_path,
     monkeypatch,
+    inline_permission_worker,
     link_kind,
 ):
     db_path = tmp_path / "lcm.db"
@@ -234,6 +436,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
 def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
     tmp_path,
     monkeypatch,
+    inline_permission_worker,
 ):
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-journal")
@@ -268,6 +471,7 @@ def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
 def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     tmp_path,
     monkeypatch,
+    inline_permission_worker,
 ):
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)
@@ -298,6 +502,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
 def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     tmp_path,
     monkeypatch,
+    inline_permission_worker,
 ):
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)

@@ -9,10 +9,13 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import errno
+import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
@@ -63,22 +66,30 @@ def _open_private_sqlite_directory(path: Path) -> int:
     return directory_fd
 
 
-def _chmod_sqlite_artifact_at(
+def _chmod_sqlite_artifact_in_worker_at(
     path: Path,
     *,
     directory_fd: int,
     create: bool,
     allow_sidecar_disappearance: bool = False,
+    expected_identity: tuple[int, int] | None = None,
 ) -> bool:
     expected: os.stat_result | None
     try:
         expected = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
+        if expected_identity is not None:
+            if allow_sidecar_disappearance:
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            raise _sqlite_artifact_error(path, "directory entry vanished before permission worker")
         if not create:
             return False
         expected = None
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
+        if expected_identity is not None and (expected.st_dev, expected.st_ino) != expected_identity:
+            raise _sqlite_artifact_error(path, "directory entry changed before permission worker")
 
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
@@ -89,10 +100,12 @@ def _chmod_sqlite_artifact_at(
     except FileExistsError:
         if expected is not None:
             raise
-        return _chmod_sqlite_artifact_at(
+        return _chmod_sqlite_artifact_in_worker_at(
             path,
             directory_fd=directory_fd,
             create=False,
+            allow_sidecar_disappearance=allow_sidecar_disappearance,
+            expected_identity=expected_identity,
         )
     except FileNotFoundError:
         if not allow_sidecar_disappearance:
@@ -119,6 +132,84 @@ def _chmod_sqlite_artifact_at(
     finally:
         os.close(fd)
     return True
+
+
+_PERMISSION_WORKER = """
+import json, runpy, sys
+from pathlib import Path
+helpers = runpy.run_path(sys.argv[1])
+request = json.loads(sys.argv[2])
+identity = request.pop('expected_identity')
+request['expected_identity'] = tuple(identity) if identity is not None else None
+request['path'] = Path(request['path'])
+try:
+    result = helpers['_chmod_sqlite_artifact_in_worker_at'](**request)
+except OSError as exc:
+    print(json.dumps({'error': [exc.errno, exc.strerror, exc.filename]}))
+else:
+    print(json.dumps({'result': result}))
+"""
+
+
+def _run_sqlite_permission_worker(path: Path, **kwargs) -> bool:
+    # Exec a fresh interpreter, not fork-with-live-SQLite. Only the parent
+    # directory fd is inherited; closing file fds in this worker cannot cancel
+    # the calling process's SQLite locks (including the WAL-index locks).
+    request = {"path": str(path), **kwargs}
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", _PERMISSION_WORKER,
+             str(Path(__file__).resolve()), json.dumps(request)],
+            pass_fds=(kwargs["directory_fd"],),
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        result = json.loads(completed.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("expected worker response object")
+        if set(result) == {"result"} and isinstance(result["result"], bool):
+            return result["result"]
+        error = result.get("error")
+        if not (
+            set(result) == {"error"}
+            and isinstance(error, list) and len(error) == 3
+            and (error[0] is None or type(error[0]) is int)
+            and (error[1] is None or isinstance(error[1], str))
+            and (error[2] is None or isinstance(error[2], str))
+        ):
+            raise ValueError("invalid permission worker response")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # Never fall back to opening live files in this process.
+        raise _sqlite_artifact_error(path, "permission worker failed") from exc
+    raise OSError(*error)
+
+
+def _chmod_sqlite_artifact_at(
+    path: Path,
+    *,
+    directory_fd: int,
+    create: bool,
+    allow_sidecar_disappearance: bool = False,
+) -> bool:
+    try:
+        expected = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            return False
+        expected = None
+    if expected is not None:
+        _validate_sqlite_artifact(path, expected)
+    # Validate even mode-0600 artifacts through O_NOFOLLOW/fstat in the worker:
+    # a stat-only fast path could miss replacement before the caller opens SQLite.
+    # Even a newly created fd can race with another thread connecting before
+    # close(). Keep all raw artifact open/close operations outside this process.
+    # This also covers loose permissions on macOS, where Linux O_PATH is absent.
+    return _run_sqlite_permission_worker(
+        path,
+        directory_fd=directory_fd,
+        create=create,
+        allow_sidecar_disappearance=allow_sidecar_disappearance,
+        expected_identity=(expected.st_dev, expected.st_ino) if expected is not None else None,
+    )
 
 
 def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
